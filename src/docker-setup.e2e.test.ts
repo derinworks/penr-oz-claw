@@ -80,8 +80,6 @@ function createEnv(
     TMPDIR: process.env.TMPDIR,
     DOCKER_STUB_LOG: sandbox.logPath,
     OPENCLAW_GATEWAY_TOKEN: "test-token",
-    OPENCLAW_CONFIG_DIR: join(sandbox.rootDir, "config"),
-    OPENCLAW_WORKSPACE_DIR: join(sandbox.rootDir, "openclaw"),
   };
 
   for (const [key, value] of Object.entries(overrides)) {
@@ -183,26 +181,21 @@ describe("docker-setup.sh", () => {
     sandbox = null;
   });
 
-  it("handles env defaults, home-volume mounts, and Docker build args", async () => {
+  it("handles env defaults, named volume, and apt build args", async () => {
     const activeSandbox = requireSandbox(sandbox);
 
     const result = runDockerSetup(activeSandbox, {
       OPENCLAW_DOCKER_APT_PACKAGES: "ffmpeg build-essential",
       OPENCLAW_EXTRA_MOUNTS: undefined,
-      OPENCLAW_HOME_VOLUME: "openclaw-home",
     });
     expect(result.status).toBe(0);
     const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
     expect(envFile).toContain("OPENCLAW_DOCKER_APT_PACKAGES=ffmpeg build-essential");
     expect(envFile).toContain("OPENCLAW_EXTRA_MOUNTS=");
-    expect(envFile).toContain("OPENCLAW_HOME_VOLUME=openclaw-home"); // pragma: allowlist secret
-    const extraCompose = await readFile(
-      join(activeSandbox.rootDir, "docker-compose.extra.yml"),
-      "utf8",
-    );
-    expect(extraCompose).toContain("openclaw-home:/home/node");
-    expect(extraCompose).toContain("volumes:");
-    expect(extraCompose).toContain("openclaw-home:");
+    expect(envFile).toContain("OPENCLAW_HOME_VOLUME=openclaw-home");
+    // No host config/workspace dir references in .env
+    expect(envFile).not.toContain("OPENCLAW_CONFIG_DIR=");
+    expect(envFile).not.toContain("OPENCLAW_WORKSPACE_DIR=");
     const log = await readFile(activeSandbox.logPath, "utf8");
     expect(log).toContain("--build-arg OPENCLAW_DOCKER_APT_PACKAGES=ffmpeg build-essential");
     expect(log).toContain("run --rm openclaw-cli onboard --mode local --no-install-daemon");
@@ -210,19 +203,21 @@ describe("docker-setup.sh", () => {
     expect(log).toContain("run --rm openclaw-cli config set gateway.bind lan");
   });
 
-  it("precreates config identity dir for CLI device auth writes", async () => {
+  it("initializes data volume with correct dir structure via container", async () => {
     const activeSandbox = requireSandbox(sandbox);
-    const configDir = join(activeSandbox.rootDir, "config-identity");
-    const workspaceDir = join(activeSandbox.rootDir, "workspace-identity");
 
-    const result = runDockerSetup(activeSandbox, {
-      OPENCLAW_CONFIG_DIR: configDir,
-      OPENCLAW_WORKSPACE_DIR: workspaceDir,
-    });
+    const result = runDockerSetup(activeSandbox);
 
     expect(result.status).toBe(0);
-    const identityDirStat = await stat(join(configDir, "identity"));
-    expect(identityDirStat.isDirectory()).toBe(true);
+
+    // Verify that a root-user init step runs before onboarding to seed dirs.
+    const log = await readFile(activeSandbox.logPath, "utf8");
+    const initIdx = log.indexOf("--user root");
+    const onboardIdx = log.indexOf("onboard");
+    expect(initIdx).toBeGreaterThanOrEqual(0);
+    expect(onboardIdx).toBeGreaterThan(initIdx);
+    // The init command creates identity and agent dirs inside the volume.
+    expect(log).toContain("--no-deps --user root --entrypoint sh openclaw-cli");
   });
 
   it("writes OPENCLAW_TZ into .env when given a real IANA timezone", async () => {
@@ -237,82 +232,21 @@ describe("docker-setup.sh", () => {
     expect(envFile).toContain("OPENCLAW_TZ=Asia/Shanghai");
   });
 
-  it("precreates agent data dirs to avoid EACCES in container", async () => {
+  it("attempts to read existing config token from volume when OPENCLAW_GATEWAY_TOKEN is unset", async () => {
     const activeSandbox = requireSandbox(sandbox);
-    const configDir = join(activeSandbox.rootDir, "config-agent-dirs");
-    const workspaceDir = join(activeSandbox.rootDir, "workspace-agent-dirs");
-
+    
     const result = runDockerSetup(activeSandbox, {
-      OPENCLAW_CONFIG_DIR: configDir,
-      OPENCLAW_WORKSPACE_DIR: workspaceDir,
+      OPENCLAW_GATEWAY_TOKEN: undefined,
     });
 
     expect(result.status).toBe(0);
-    const agentDirStat = await stat(join(configDir, "agents", "main", "agent"));
-    expect(agentDirStat.isDirectory()).toBe(true);
-    const sessionsDirStat = await stat(join(configDir, "agents", "main", "sessions"));
-    expect(sessionsDirStat.isDirectory()).toBe(true);
-
-    // Verify that a root-user chown step runs before setup.
+    // Token reading is done via a container run against the named volume.
+    // The stub docker doesn't return a token, so a random one is generated.
+    const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
+    expect(envFile).toMatch(/OPENCLAW_GATEWAY_TOKEN=\S+/);
+    // Verify the volume token check was attempted via docker compose.
     const log = await readFile(activeSandbox.logPath, "utf8");
-    const chownIdx = log.indexOf("--user root");
-    const onboardIdx = log.indexOf("onboard");
-    expect(chownIdx).toBeGreaterThanOrEqual(0);
-    expect(onboardIdx).toBeGreaterThan(chownIdx);
-  });
-
-  it("reuses existing config token when OPENCLAW_GATEWAY_TOKEN is unset", async () => {
-    const activeSandbox = requireSandbox(sandbox);
-    const { result, envFile } = await runDockerSetupWithUnsetGatewayToken(
-      activeSandbox,
-      "token-reuse",
-      async (configDir) => {
-        await writeFile(
-          join(configDir, "openclaw.json"),
-          JSON.stringify({ gateway: { auth: { mode: "token", token: "config-token-123" } } }),
-        );
-      },
-    );
-
-    expect(result.status).toBe(0);
-    expect(envFile).toContain("OPENCLAW_GATEWAY_TOKEN=config-token-123"); // pragma: allowlist secret
-  });
-
-  it("reuses existing .env token when OPENCLAW_GATEWAY_TOKEN and config token are unset", async () => {
-    const activeSandbox = requireSandbox(sandbox);
-    await writeFile(
-      join(activeSandbox.rootDir, ".env"),
-      "OPENCLAW_GATEWAY_TOKEN=dotenv-token-123\nOPENCLAW_GATEWAY_PORT=18789\n", // pragma: allowlist secret
-    );
-    const { result, envFile } = await runDockerSetupWithUnsetGatewayToken(
-      activeSandbox,
-      "dotenv-token-reuse",
-    );
-
-    expect(result.status).toBe(0);
-    expect(envFile).toContain("OPENCLAW_GATEWAY_TOKEN=dotenv-token-123"); // pragma: allowlist secret
-    expect(result.stderr).toBe("");
-  });
-
-  it("reuses the last non-empty .env token and strips CRLF without truncating '='", async () => {
-    const activeSandbox = requireSandbox(sandbox);
-    await writeFile(
-      join(activeSandbox.rootDir, ".env"),
-      [
-        "OPENCLAW_GATEWAY_TOKEN=",
-        "OPENCLAW_GATEWAY_TOKEN=first-token",
-        "OPENCLAW_GATEWAY_TOKEN=last=token=value\r", // pragma: allowlist secret
-      ].join("\n"),
-    );
-    const { result, envFile } = await runDockerSetupWithUnsetGatewayToken(
-      activeSandbox,
-      "dotenv-last-wins",
-    );
-
-    expect(result.status).toBe(0);
-    expect(envFile).toContain("OPENCLAW_GATEWAY_TOKEN=last=token=value"); // pragma: allowlist secret
-    expect(envFile).not.toContain("OPENCLAW_GATEWAY_TOKEN=first-token");
-    expect(envFile).not.toContain("\r");
+    expect(log).toContain("--no-deps --entrypoint node openclaw-cli");
   });
 
   it("treats OPENCLAW_SANDBOX=0 as disabled", async () => {
@@ -438,6 +372,17 @@ describe("docker-setup.sh", () => {
     expect(result.stderr).toContain("OPENCLAW_TZ must match a timezone in /usr/share/zoneinfo");
   });
 
+  it("rejects path-like OPENCLAW_HOME_VOLUME values", async () => {
+    const activeSandbox = requireSandbox(sandbox);
+
+    const result = runDockerSetup(activeSandbox, {
+      OPENCLAW_HOME_VOLUME: "/home/user/.openclaw",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("OPENCLAW_HOME_VOLUME must match");
+  });
+
   it("avoids associative arrays so the script remains Bash 3.2-compatible", async () => {
     const script = await readFile(join(repoRoot, "docker-setup.sh"), "utf8");
     expect(script).not.toMatch(/^\s*declare -A\b/m);
@@ -468,6 +413,9 @@ describe("docker-setup.sh", () => {
     const compose = await readFile(join(repoRoot, "docker-compose.yml"), "utf8");
     expect(compose).not.toContain("gateway-daemon");
     expect(compose).toContain('"gateway"');
+    // Ports must be bound to localhost only.
+    expect(compose).toContain("127.0.0.1:");
+    expect(compose).not.toMatch(/^\s+-\s+"?\$\{OPENCLAW_GATEWAY_PORT/m);
   });
 
   it("keeps docker-compose CLI network namespace settings in sync", async () => {

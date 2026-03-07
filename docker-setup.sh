@@ -6,7 +6,7 @@ COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
 EXTRA_COMPOSE_FILE="$ROOT_DIR/docker-compose.extra.yml"
 IMAGE_NAME="${OPENCLAW_IMAGE:-openclaw:local}"
 EXTRA_MOUNTS="${OPENCLAW_EXTRA_MOUNTS:-}"
-HOME_VOLUME_NAME="${OPENCLAW_HOME_VOLUME:-}"
+HOME_VOLUME_NAME="${OPENCLAW_HOME_VOLUME:-openclaw-home}"
 RAW_SANDBOX_SETTING="${OPENCLAW_SANDBOX:-}"
 SANDBOX_ENABLED=""
 DOCKER_SOCKET_PATH="${OPENCLAW_DOCKER_SOCKET:-}"
@@ -32,53 +32,12 @@ is_truthy_value() {
     *) return 1 ;;
   esac
 }
-
 read_config_gateway_token() {
-  local config_path="$OPENCLAW_CONFIG_DIR/openclaw.json"
-  if [[ ! -f "$config_path" ]]; then
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$config_path" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-except Exception:
-    raise SystemExit(0)
-
-gateway = cfg.get("gateway")
-if not isinstance(gateway, dict):
-    raise SystemExit(0)
-auth = gateway.get("auth")
-if not isinstance(auth, dict):
-    raise SystemExit(0)
-token = auth.get("token")
-if isinstance(token, str):
-    token = token.strip()
-    if token:
-        print(token)
-PY
-    return 0
-  fi
-  if command -v node >/dev/null 2>&1; then
-    node - "$config_path" <<'NODE'
-const fs = require("node:fs");
-const configPath = process.argv[2];
-try {
-  const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  const token = cfg?.gateway?.auth?.token;
-  if (typeof token === "string" && token.trim().length > 0) {
-    process.stdout.write(token.trim());
-  }
-} catch {
-  // Keep docker-setup resilient when config parsing fails.
-}
-NODE
-  fi
+  # Read token from the named volume via a temporary container.
+  # Returns empty if the volume doesn't exist yet or has no config.
+  docker compose "${COMPOSE_ARGS[@]}" run --rm --entrypoint node openclaw-cli \
+    -e 'try{const c=JSON.parse(require("node:fs").readFileSync("/home/node/.openclaw/openclaw.json","utf8"));const t=c?.gateway?.auth?.token;if(typeof t==="string"&&t.trim().length>0)process.stdout.write(t.trim())}catch{}' \
+    2>/dev/null || true
 }
 
 read_env_gateway_token() {
@@ -190,18 +149,7 @@ if is_truthy_value "$RAW_SANDBOX_SETTING"; then
   SANDBOX_ENABLED="1"
 fi
 
-OPENCLAW_CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
-OPENCLAW_WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
-
-validate_mount_path_value "OPENCLAW_CONFIG_DIR" "$OPENCLAW_CONFIG_DIR"
-validate_mount_path_value "OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_WORKSPACE_DIR"
-if [[ -n "$HOME_VOLUME_NAME" ]]; then
-  if [[ "$HOME_VOLUME_NAME" == *"/"* ]]; then
-    validate_mount_path_value "OPENCLAW_HOME_VOLUME" "$HOME_VOLUME_NAME"
-  else
-    validate_named_volume "$HOME_VOLUME_NAME"
-  fi
-fi
+validate_named_volume "$HOME_VOLUME_NAME"
 if contains_disallowed_chars "$EXTRA_MOUNTS"; then
   fail "OPENCLAW_EXTRA_MOUNTS cannot contain control characters."
 fi
@@ -220,18 +168,9 @@ if [[ -n "$TIMEZONE" ]]; then
   fi
 fi
 
-mkdir -p "$OPENCLAW_CONFIG_DIR"
-mkdir -p "$OPENCLAW_WORKSPACE_DIR"
-# Seed directory tree eagerly so bind mounts work even on Docker Desktop/Windows
-# where the container (even as root) cannot create new host subdirectories.
-mkdir -p "$OPENCLAW_CONFIG_DIR/identity"
-mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/agent"
-mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/sessions"
-
-export OPENCLAW_CONFIG_DIR
-export OPENCLAW_WORKSPACE_DIR
 export OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
 export OPENCLAW_BRIDGE_PORT="${OPENCLAW_BRIDGE_PORT:-18790}"
+export OPENCLAW_PORT_BIND_ADDR="${OPENCLAW_PORT_BIND_ADDR:-127.0.0.1}"
 export OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
 export OPENCLAW_IMAGE="$IMAGE_NAME"
 export OPENCLAW_DOCKER_APT_PACKAGES="${OPENCLAW_DOCKER_APT_PACKAGES:-}"
@@ -280,28 +219,13 @@ write_extra_compose() {
   local home_volume="$1"
   shift
   local mount
-  local gateway_home_mount
-  local gateway_config_mount
-  local gateway_workspace_mount
 
   cat >"$EXTRA_COMPOSE_FILE" <<'YAML'
 services:
   openclaw-gateway:
     volumes:
 YAML
-
-  if [[ -n "$home_volume" ]]; then
-    gateway_home_mount="${home_volume}:/home/node"
-    gateway_config_mount="${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw"
-    gateway_workspace_mount="${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace"
-    validate_mount_spec "$gateway_home_mount"
-    validate_mount_spec "$gateway_config_mount"
-    validate_mount_spec "$gateway_workspace_mount"
-    printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s\n' "$gateway_config_mount" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s\n' "$gateway_workspace_mount" >>"$EXTRA_COMPOSE_FILE"
-  fi
-
+  printf '      - openclaw-home:/home/node\n' >>"$EXTRA_COMPOSE_FILE"
   for mount in "$@"; do
     validate_mount_spec "$mount"
     printf '      - %s\n' "$mount" >>"$EXTRA_COMPOSE_FILE"
@@ -311,25 +235,17 @@ YAML
   openclaw-cli:
     volumes:
 YAML
-
-  if [[ -n "$home_volume" ]]; then
-    printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s\n' "$gateway_config_mount" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s\n' "$gateway_workspace_mount" >>"$EXTRA_COMPOSE_FILE"
-  fi
-
+  printf '      - openclaw-home:/home/node\n' >>"$EXTRA_COMPOSE_FILE"
   for mount in "$@"; do
     validate_mount_spec "$mount"
     printf '      - %s\n' "$mount" >>"$EXTRA_COMPOSE_FILE"
   done
 
-  if [[ -n "$home_volume" && "$home_volume" != *"/"* ]]; then
-    validate_named_volume "$home_volume"
-    cat >>"$EXTRA_COMPOSE_FILE" <<YAML
+  cat >>"$EXTRA_COMPOSE_FILE" <<YAML
 volumes:
-  ${home_volume}:
+  openclaw-home:
+    name: ${home_volume}
 YAML
-  fi
 }
 
 # When sandbox is requested, ensure Docker CLI build arg is set for local builds.
@@ -352,15 +268,13 @@ if [[ -n "$EXTRA_MOUNTS" ]]; then
   done
 fi
 
-if [[ -n "$HOME_VOLUME_NAME" || ${#VALID_MOUNTS[@]} -gt 0 ]]; then
-  # Bash 3.2 + nounset treats "${array[@]}" on an empty array as unbound.
-  if [[ ${#VALID_MOUNTS[@]} -gt 0 ]]; then
-    write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
-  else
-    write_extra_compose "$HOME_VOLUME_NAME"
-  fi
-  COMPOSE_FILES+=("$EXTRA_COMPOSE_FILE")
+# Always generate extra compose to declare the named volume; include extra mounts if any.
+if [[ ${#VALID_MOUNTS[@]} -gt 0 ]]; then
+  write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
+else
+  write_extra_compose "$HOME_VOLUME_NAME"
 fi
+COMPOSE_FILES+=("$EXTRA_COMPOSE_FILE")
 for compose_file in "${COMPOSE_FILES[@]}"; do
   COMPOSE_ARGS+=("-f" "$compose_file")
 done
@@ -411,10 +325,9 @@ upsert_env() {
 }
 
 upsert_env "$ENV_FILE" \
-  OPENCLAW_CONFIG_DIR \
-  OPENCLAW_WORKSPACE_DIR \
   OPENCLAW_GATEWAY_PORT \
   OPENCLAW_BRIDGE_PORT \
+  OPENCLAW_PORT_BIND_ADDR \
   OPENCLAW_GATEWAY_BIND \
   OPENCLAW_GATEWAY_TOKEN \
   OPENCLAW_IMAGE \
@@ -459,7 +372,9 @@ echo "==> Fixing data-directory permissions"
 # After fixing the config dir, only the OpenClaw metadata subdirectory
 # (.openclaw/) inside the workspace gets chowned, not the user's project files.
 docker compose "${COMPOSE_ARGS[@]}" run --rm --user root --entrypoint sh openclaw-cli -c \
-  'find /home/node/.openclaw -xdev -exec chown node:node {} +; \
+  'mkdir -p /home/node/.openclaw/identity /home/node/.openclaw/agents/main/agent /home/node/.openclaw/agents/main/sessions; \
+   mkdir -p /home/node/.openclaw/workspace; \
+   find /home/node/.openclaw -xdev -exec chown node:node {} +; \
    [ -d /home/node/.openclaw/workspace/.openclaw ] && chown -R node:node /home/node/.openclaw/workspace/.openclaw || true'
 
 echo ""
@@ -607,9 +522,9 @@ fi
 echo ""
 echo "Gateway running with host port mapping."
 echo "Access from tailnet devices via the host's tailnet IP."
-echo "Config: $OPENCLAW_CONFIG_DIR"
-echo "Workspace: $OPENCLAW_WORKSPACE_DIR"
+echo "Data volume: $HOME_VOLUME_NAME"
 echo "Token: $OPENCLAW_GATEWAY_TOKEN"
+echo "Port bind address: $OPENCLAW_PORT_BIND_ADDR"
 echo ""
 echo "Commands:"
 echo "  ${COMPOSE_HINT} logs -f openclaw-gateway"

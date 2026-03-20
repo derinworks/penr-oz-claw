@@ -12,6 +12,16 @@ SANDBOX_ENABLED=""
 DOCKER_SOCKET_PATH="${OPENCLAW_DOCKER_SOCKET:-}"
 TIMEZONE="${OPENCLAW_TZ:-}"
 
+# Temp file for the --no-deps + network_mode:bridge Compose override used by
+# config read/write calls that must not start (or join) the gateway service.
+BRIDGE_OVERRIDE_FILE="$(mktemp)"
+trap 'rm -f "$BRIDGE_OVERRIDE_FILE"' EXIT
+cat >"$BRIDGE_OVERRIDE_FILE" <<'YAML'
+services:
+  openclaw-cli:
+    network_mode: bridge
+YAML
+
 fail() {
   echo "ERROR: $*" >&2
   exit 1
@@ -32,53 +42,64 @@ is_truthy_value() {
     *) return 1 ;;
   esac
 }
-
 read_config_gateway_token() {
-  local config_path="$OPENCLAW_CONFIG_DIR/openclaw.json"
-  if [[ ! -f "$config_path" ]]; then
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$config_path" <<'PY'
-import json
-import sys
+  local token=""
+  # Read token from the named volume via a temporary container.
+  # Returns empty if the volume doesn't exist yet or has no config.
+  token="$(docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps --entrypoint node openclaw-cli \
+    -e 'try{const c=JSON.parse(require("node:fs").readFileSync("/home/node/.openclaw/openclaw.json","utf8"));const t=c?.gateway?.auth?.token;if(typeof t==="string"&&t.trim().length>0)process.stdout.write(t.trim())}catch{}' \
+    2>/dev/null || true)"
 
-path = sys.argv[1]
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-except Exception:
-    raise SystemExit(0)
-
-gateway = cfg.get("gateway")
-if not isinstance(gateway, dict):
-    raise SystemExit(0)
-auth = gateway.get("auth")
-if not isinstance(auth, dict):
-    raise SystemExit(0)
-token = auth.get("token")
-if isinstance(token, str):
-    token = token.strip()
-    if token:
-        print(token)
-PY
-    return 0
+  if [[ -z "$token" ]] && is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
+    local host_config="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
+    if [[ -f "$host_config/openclaw.json" ]]; then
+      token="$(docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps -v "${host_config}:/tmp/host_config:ro" --entrypoint node openclaw-cli \
+        -e 'try{const c=JSON.parse(require("node:fs").readFileSync("/tmp/host_config/openclaw.json","utf8"));const t=c?.gateway?.auth?.token;if(typeof t==="string"&&t.trim().length>0)process.stdout.write(t.trim())}catch{}' \
+        2>/dev/null || true)"
+    fi
   fi
-  if command -v node >/dev/null 2>&1; then
-    node - "$config_path" <<'NODE'
-const fs = require("node:fs");
-const configPath = process.argv[2];
-try {
-  const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  const token = cfg?.gateway?.auth?.token;
-  if (typeof token === "string" && token.trim().length > 0) {
-    process.stdout.write(token.trim());
-  }
-} catch {
-  // Keep docker-setup resilient when config parsing fails.
+
+  if [[ -n "$token" ]]; then
+    printf '%s' "$token"
+  fi
 }
-NODE
+
+migrate_legacy_host_data() {
+  if ! is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
+    return 0
   fi
+
+  local host_config="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
+  local host_workspace="${OPENCLAW_WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
+
+  if [[ ! -f "$host_config/openclaw.json" ]]; then
+    return 0
+  fi
+
+  local has_isolated_config
+  has_isolated_config="$(
+    docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps --entrypoint node openclaw-cli \
+      -e 'try{require("node:fs").accessSync("/home/node/.openclaw/openclaw.json");process.stdout.write("1")}catch{}' \
+      2>/dev/null || true
+  )"
+
+  if [[ "$has_isolated_config" == "1" ]]; then
+    return 0
+  fi
+
+  echo "==> Migrating legacy configurations to isolated Docker volume"
+  docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps --user root \
+    -v "${host_config}:/tmp/host_config:ro" \
+    -v "${host_workspace}:/tmp/host_workspace:ro" \
+    --entrypoint sh openclaw-cli -c \
+    'mkdir -p /home/node/.openclaw/workspace; \
+     [ -d /tmp/host_config ] && cp -R /tmp/host_config/. /home/node/.openclaw/ 2>/dev/null || true; \
+     [ -d /tmp/host_workspace ] && cp -R /tmp/host_workspace/. /home/node/.openclaw/workspace/ 2>/dev/null || true; \
+     chown -R node:node /home/node/.openclaw; \
+     [ -d /home/node/.openclaw/workspace/.openclaw ] && chown -R node:node /home/node/.openclaw/workspace/.openclaw || true'
+     
+  echo "Migration complete."
+  echo ""
 }
 
 read_env_gateway_token() {
@@ -108,7 +129,7 @@ ensure_control_ui_allowed_origins() {
   local current_allowed_origins
   allowed_origin_json="$(printf '["http://127.0.0.1:%s"]' "$OPENCLAW_GATEWAY_PORT")"
   current_allowed_origins="$(
-    docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli \
+    docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps openclaw-cli \
       config get gateway.controlUi.allowedOrigins 2>/dev/null || true
   )"
   current_allowed_origins="${current_allowed_origins//$'\r'/}"
@@ -118,15 +139,16 @@ ensure_control_ui_allowed_origins() {
     return 0
   fi
 
-  docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli \
+  docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps openclaw-cli \
     config set gateway.controlUi.allowedOrigins "$allowed_origin_json" --strict-json >/dev/null
   echo "Set gateway.controlUi.allowedOrigins to $allowed_origin_json for non-loopback bind."
 }
 
 sync_gateway_mode_and_bind() {
-  docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli \
+  docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps openclaw-cli \
     config set gateway.mode local >/dev/null
-  docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli \
+
+  docker compose "${COMPOSE_ARGS[@]}" -f "$BRIDGE_OVERRIDE_FILE" run --rm --no-deps openclaw-cli \
     config set gateway.bind "$OPENCLAW_GATEWAY_BIND" >/dev/null
   echo "Pinned gateway.mode=local and gateway.bind=$OPENCLAW_GATEWAY_BIND for Docker setup."
 }
@@ -155,8 +177,15 @@ validate_mount_path_value() {
   fi
 }
 
+
+
 validate_named_volume() {
   local value="$1"
+  # Let Docker handle raw bind paths natively
+  if [[ "$value" == /* || "$value" == ./* || "$value" == ../* || "$value" == ~/* ]]; then
+    validate_mount_path_value "OPENCLAW_HOME_VOLUME" "$value"
+    return 0
+  fi
   if [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
     fail "OPENCLAW_HOME_VOLUME must match [A-Za-z0-9][A-Za-z0-9_.-]* when using a named volume."
   fi
@@ -193,15 +222,17 @@ fi
 OPENCLAW_CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 OPENCLAW_WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
 
-validate_mount_path_value "OPENCLAW_CONFIG_DIR" "$OPENCLAW_CONFIG_DIR"
-validate_mount_path_value "OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_WORKSPACE_DIR"
-if [[ -n "$HOME_VOLUME_NAME" ]]; then
-  if [[ "$HOME_VOLUME_NAME" == *"/"* ]]; then
-    validate_mount_path_value "OPENCLAW_HOME_VOLUME" "$HOME_VOLUME_NAME"
-  else
-    validate_named_volume "$HOME_VOLUME_NAME"
-  fi
+if ! is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
+  validate_mount_path_value "OPENCLAW_CONFIG_DIR" "$OPENCLAW_CONFIG_DIR"
+  validate_mount_path_value "OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_WORKSPACE_DIR"
 fi
+
+
+
+if [[ -n "$HOME_VOLUME_NAME" ]]; then
+  validate_named_volume "$HOME_VOLUME_NAME"
+fi
+
 if contains_disallowed_chars "$EXTRA_MOUNTS"; then
   fail "OPENCLAW_EXTRA_MOUNTS cannot contain control characters."
 fi
@@ -220,16 +251,23 @@ if [[ -n "$TIMEZONE" ]]; then
   fi
 fi
 
-mkdir -p "$OPENCLAW_CONFIG_DIR"
-mkdir -p "$OPENCLAW_WORKSPACE_DIR"
-# Seed directory tree eagerly so bind mounts work even on Docker Desktop/Windows
-# where the container (even as root) cannot create new host subdirectories.
-mkdir -p "$OPENCLAW_CONFIG_DIR/identity"
-mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/agent"
-mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/sessions"
-
 export OPENCLAW_CONFIG_DIR
 export OPENCLAW_WORKSPACE_DIR
+
+if is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
+  export OPENCLAW_PORT_BIND_ADDR="${OPENCLAW_PORT_BIND_ADDR:-127.0.0.1}"
+  if [[ -z "$HOME_VOLUME_NAME" ]]; then
+    HOME_VOLUME_NAME="openclaw-home"
+  fi
+else
+  export OPENCLAW_PORT_BIND_ADDR="${OPENCLAW_PORT_BIND_ADDR:-0.0.0.0}"
+  mkdir -p "$OPENCLAW_CONFIG_DIR"
+  mkdir -p "$OPENCLAW_WORKSPACE_DIR"
+  mkdir -p "$OPENCLAW_CONFIG_DIR/identity"
+  mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/agent"
+  mkdir -p "$OPENCLAW_CONFIG_DIR/agents/main/sessions"
+fi
+
 export OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
 export OPENCLAW_BRIDGE_PORT="${OPENCLAW_BRIDGE_PORT:-18790}"
 export OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
@@ -250,29 +288,6 @@ if [[ -n "$SANDBOX_ENABLED" && -S "$DOCKER_SOCKET_PATH" ]]; then
 fi
 export DOCKER_GID
 
-if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
-  EXISTING_CONFIG_TOKEN="$(read_config_gateway_token || true)"
-  if [[ -n "$EXISTING_CONFIG_TOKEN" ]]; then
-    OPENCLAW_GATEWAY_TOKEN="$EXISTING_CONFIG_TOKEN"
-    echo "Reusing gateway token from $OPENCLAW_CONFIG_DIR/openclaw.json"
-  else
-    DOTENV_GATEWAY_TOKEN="$(read_env_gateway_token "$ROOT_DIR/.env" || true)"
-    if [[ -n "$DOTENV_GATEWAY_TOKEN" ]]; then
-      OPENCLAW_GATEWAY_TOKEN="$DOTENV_GATEWAY_TOKEN"
-      echo "Reusing gateway token from $ROOT_DIR/.env"
-    elif command -v openssl >/dev/null 2>&1; then
-      OPENCLAW_GATEWAY_TOKEN="$(openssl rand -hex 32)"
-    else
-      OPENCLAW_GATEWAY_TOKEN="$(python3 - <<'PY'
-import secrets
-print(secrets.token_hex(32))
-PY
-)"
-    fi
-  fi
-fi
-export OPENCLAW_GATEWAY_TOKEN
-
 COMPOSE_FILES=("$COMPOSE_FILE")
 COMPOSE_ARGS=()
 
@@ -290,14 +305,19 @@ services:
     volumes:
 YAML
 
-  if [[ -n "$home_volume" ]]; then
-    gateway_home_mount="${home_volume}:/home/node"
+  if is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
+    printf '      - openclaw-home:/home/node/.openclaw\n' >>"$EXTRA_COMPOSE_FILE"
+    printf '      - openclaw-workspace:/home/node/.openclaw/workspace\n' >>"$EXTRA_COMPOSE_FILE"
+  else
+    if [[ -n "$home_volume" ]]; then
+      gateway_home_mount="${home_volume}:/home/node"
+      validate_mount_spec "$gateway_home_mount"
+      printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
+    fi
     gateway_config_mount="${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw"
     gateway_workspace_mount="${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace"
-    validate_mount_spec "$gateway_home_mount"
     validate_mount_spec "$gateway_config_mount"
     validate_mount_spec "$gateway_workspace_mount"
-    printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
     printf '      - %s\n' "$gateway_config_mount" >>"$EXTRA_COMPOSE_FILE"
     printf '      - %s\n' "$gateway_workspace_mount" >>"$EXTRA_COMPOSE_FILE"
   fi
@@ -312,8 +332,13 @@ YAML
     volumes:
 YAML
 
-  if [[ -n "$home_volume" ]]; then
-    printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
+  if is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
+    printf '      - openclaw-home:/home/node/.openclaw\n' >>"$EXTRA_COMPOSE_FILE"
+    printf '      - openclaw-workspace:/home/node/.openclaw/workspace\n' >>"$EXTRA_COMPOSE_FILE"
+  else
+    if [[ -n "$home_volume" ]]; then
+      printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
+    fi
     printf '      - %s\n' "$gateway_config_mount" >>"$EXTRA_COMPOSE_FILE"
     printf '      - %s\n' "$gateway_workspace_mount" >>"$EXTRA_COMPOSE_FILE"
   fi
@@ -323,12 +348,21 @@ YAML
     printf '      - %s\n' "$mount" >>"$EXTRA_COMPOSE_FILE"
   done
 
-  if [[ -n "$home_volume" && "$home_volume" != *"/"* ]]; then
-    validate_named_volume "$home_volume"
+  if is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
     cat >>"$EXTRA_COMPOSE_FILE" <<YAML
+volumes:
+  openclaw-home:
+    name: ${home_volume}
+  openclaw-workspace:
+    name: ${home_volume}-workspace
+YAML
+  else
+    if [[ -n "$home_volume" && "$home_volume" != *"/"* ]]; then
+      cat >>"$EXTRA_COMPOSE_FILE" <<YAML
 volumes:
   ${home_volume}:
 YAML
+    fi
   fi
 }
 
@@ -352,15 +386,13 @@ if [[ -n "$EXTRA_MOUNTS" ]]; then
   done
 fi
 
-if [[ -n "$HOME_VOLUME_NAME" || ${#VALID_MOUNTS[@]} -gt 0 ]]; then
-  # Bash 3.2 + nounset treats "${array[@]}" on an empty array as unbound.
-  if [[ ${#VALID_MOUNTS[@]} -gt 0 ]]; then
-    write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
-  else
-    write_extra_compose "$HOME_VOLUME_NAME"
-  fi
-  COMPOSE_FILES+=("$EXTRA_COMPOSE_FILE")
+# Always generate extra compose to declare the named volume; include extra mounts if any.
+if [[ ${#VALID_MOUNTS[@]} -gt 0 ]]; then
+  write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
+else
+  write_extra_compose "$HOME_VOLUME_NAME"
 fi
+COMPOSE_FILES+=("$EXTRA_COMPOSE_FILE")
 for compose_file in "${COMPOSE_FILES[@]}"; do
   COMPOSE_ARGS+=("-f" "$compose_file")
 done
@@ -371,6 +403,29 @@ COMPOSE_HINT="docker compose"
 for compose_file in "${COMPOSE_FILES[@]}"; do
   COMPOSE_HINT+=" -f ${compose_file}"
 done
+
+if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+  EXISTING_CONFIG_TOKEN="$(read_config_gateway_token || true)"
+  if [[ -n "$EXISTING_CONFIG_TOKEN" ]]; then
+    OPENCLAW_GATEWAY_TOKEN="$EXISTING_CONFIG_TOKEN"
+    echo "Reusing gateway token from $OPENCLAW_CONFIG_DIR/openclaw.json"
+  else
+    DOTENV_GATEWAY_TOKEN="$(read_env_gateway_token "$ROOT_DIR/.env" || true)"
+    if [[ -n "$DOTENV_GATEWAY_TOKEN" ]]; then
+      OPENCLAW_GATEWAY_TOKEN="$DOTENV_GATEWAY_TOKEN"
+      echo "Reusing gateway token from $ROOT_DIR/.env"
+    elif command -v openssl >/dev/null 2>&1; then
+      OPENCLAW_GATEWAY_TOKEN="$(openssl rand -hex 32)"
+    else
+      OPENCLAW_GATEWAY_TOKEN="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)"
+    fi
+  fi
+fi
+export OPENCLAW_GATEWAY_TOKEN
 
 ENV_FILE="$ROOT_DIR/.env"
 upsert_env() {
@@ -413,8 +468,10 @@ upsert_env() {
 upsert_env "$ENV_FILE" \
   OPENCLAW_CONFIG_DIR \
   OPENCLAW_WORKSPACE_DIR \
+  OPENCLAW_ISOLATED_DOCKER_SETUP \
   OPENCLAW_GATEWAY_PORT \
   OPENCLAW_BRIDGE_PORT \
+  OPENCLAW_PORT_BIND_ADDR \
   OPENCLAW_GATEWAY_BIND \
   OPENCLAW_GATEWAY_TOKEN \
   OPENCLAW_IMAGE \
@@ -446,6 +503,8 @@ else
   fi
 fi
 
+migrate_legacy_host_data
+
 # Ensure bind-mounted data directories are writable by the container's `node`
 # user (uid 1000). Host-created dirs inherit the host user's uid which may
 # differ, causing EACCES when the container tries to mkdir/write.
@@ -459,7 +518,9 @@ echo "==> Fixing data-directory permissions"
 # After fixing the config dir, only the OpenClaw metadata subdirectory
 # (.openclaw/) inside the workspace gets chowned, not the user's project files.
 docker compose "${COMPOSE_ARGS[@]}" run --rm --user root --entrypoint sh openclaw-cli -c \
-  'find /home/node/.openclaw -xdev -exec chown node:node {} +; \
+  'mkdir -p /home/node/.openclaw/identity /home/node/.openclaw/agents/main/agent /home/node/.openclaw/agents/main/sessions; \
+   mkdir -p /home/node/.openclaw/workspace; \
+   find /home/node/.openclaw -xdev -exec chown node:node {} +; \
    [ -d /home/node/.openclaw/workspace/.openclaw ] && chown -R node:node /home/node/.openclaw/workspace/.openclaw || true'
 
 echo ""
@@ -607,9 +668,14 @@ fi
 echo ""
 echo "Gateway running with host port mapping."
 echo "Access from tailnet devices via the host's tailnet IP."
-echo "Config: $OPENCLAW_CONFIG_DIR"
-echo "Workspace: $OPENCLAW_WORKSPACE_DIR"
+if is_truthy_value "${OPENCLAW_ISOLATED_DOCKER_SETUP:-}"; then
+  echo "Data volume: $HOME_VOLUME_NAME"
+else
+  echo "Config: $OPENCLAW_CONFIG_DIR"
+  echo "Workspace: $OPENCLAW_WORKSPACE_DIR"
+fi
 echo "Token: $OPENCLAW_GATEWAY_TOKEN"
+echo "Port bind address: $OPENCLAW_PORT_BIND_ADDR"
 echo ""
 echo "Commands:"
 echo "  ${COMPOSE_HINT} logs -f openclaw-gateway"

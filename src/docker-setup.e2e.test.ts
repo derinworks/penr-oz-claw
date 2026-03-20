@@ -36,6 +36,10 @@ if [[ "\${1:-}" == "compose" ]]; then
     echo "compose-fail $*" >>"$log"
     exit 1
   fi
+  if [[ "$*" == *'process.stdout.write'* ]]; then
+    # Mock containerized config token read by targeting host-side OPENCLAW_CONFIG_DIR.
+    node -e 'try{const c=JSON.parse(require("node:fs").readFileSync(process.env.OPENCLAW_CONFIG_DIR+"/openclaw.json","utf8"));const t=c?.gateway?.auth?.token;if(typeof t==="string"&&t.trim().length>0)process.stdout.write(t.trim())}catch{}'
+  fi
   echo "compose $*" >>"$log"
   exit 0
 fi
@@ -207,8 +211,8 @@ describe("scripts/docker/setup.sh", () => {
     const log = await readFile(activeSandbox.logPath, "utf8");
     expect(log).toContain("--build-arg OPENCLAW_DOCKER_APT_PACKAGES=ffmpeg build-essential");
     expect(log).toContain("run --rm openclaw-cli onboard --mode local --no-install-daemon");
-    expect(log).toContain("run --rm openclaw-cli config set gateway.mode local");
-    expect(log).toContain("run --rm openclaw-cli config set gateway.bind lan");
+    expect(log).toContain("--no-deps openclaw-cli config set gateway.mode local");
+    expect(log).toContain("--no-deps openclaw-cli config set gateway.bind lan");
   });
 
   it("precreates config identity dir for CLI device auth writes", async () => {
@@ -491,5 +495,18 @@ describe("scripts/docker/setup.sh", () => {
   it("keeps docker-compose timezone env defaults aligned across services", async () => {
     const compose = await readFile(join(repoRoot, "docker-compose.yml"), "utf8");
     expect(compose.match(/TZ: \$\{OPENCLAW_TZ:-UTC\}/g)).toHaveLength(2);
+  });
+
+  it("handles OPENCLAW_ISOLATED_DOCKER_SETUP option", async () => {
+    const activeSandbox = requireSandbox(sandbox);
+    await writeFile(activeSandbox.logPath, "");
+
+    const result = runDockerSetup(activeSandbox, {
+      OPENCLAW_ISOLATED_DOCKER_SETUP: "1",
+    });
+    expect(result.status).toBe(0);
+    const envFile = await readFile(join(activeSandbox.rootDir, ".env"), "utf8");
+    expect(envFile).toContain("OPENCLAW_ISOLATED_DOCKER_SETUP=1");
+    expect(envFile).toContain("OPENCLAW_PORT_BIND_ADDR=127.0.0.1");
   });
 });
